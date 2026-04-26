@@ -88,13 +88,30 @@ Team reviewed output and applied manual fixes.
 Main fixes covered graph scaling math, calibration state flow, and timeout control.
 
 Challenges We Ran Into
-To be filled by team.
+We spent time deciding between three architectures: USB serial with Python backend, Bluetooth, and standalone ESP32 Wi-Fi.
+USB serial gave strong debug visibility, but added laptop setup steps for users.
+Bluetooth reduced wires, but browser support and pairing flow added friction for a fast demo.
+We moved back to standalone ESP32 Wi-Fi with captive portal because setup stayed simple and repeatable.
+We also worked through reliability issues while serving both dashboard and live /data responses from one ESP32.
+Calibration flow started as technical, then we rewrote it into a guided rest and target sequence using /calibrate/rest and /calibrate/target.
+FSR threshold tuning required repeated tests because sensor values are relative and shift with strap tension, hand position, and surface type.
+We avoided claiming exact compression depth in centimeters because accelerometer integration drift can accumulate error over time.
 
 What We Learned
-To be filled by team.
+We learned how to configure ESP32 as a Wi-Fi access point named CPR_Trainer and route captive portal traffic with DNSServer.
+We learned how a browser dashboard can talk to an embedded device through simple HTTP endpoints like /data and calibration routes.
+We learned how to combine FSR force data and ADXL335 motion data for relative compression quality, rate, recoil, and motion quality feedback.
+We learned that calibration and threshold tuning matter as much as UI polish for trustworthy coaching behavior.
+We learned that a clear project split between firmware and frontend folders helps development move faster and keeps responsibilities clear.
 
 What Is Next for CPR Trainer
-To be filled by team.
+Improve calibration flow with more guided testing prompts and clearer completion checks.
+Tune force thresholds across more users and more surfaces to improve consistency.
+Add stronger recoil detection logic for edge cases where users keep slight pressure after release.
+Evaluate adding a true distance sensor if future versions require exact compression depth measurement.
+Improve enclosure and wristband comfort for longer practice sessions.
+Add data logging and session summaries so users can review progress over time.
+Improve mobile dashboard layout for smaller screens and faster one-hand use.
 
 Repository Structure
 README.md
