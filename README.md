@@ -160,6 +160,7 @@ We also worked through reliability issues while serving both dashboard and live 
 - Add data logging and session summaries so users can review progress over time.
 - Improve mobile dashboard layout for smaller screens and faster one-hand use.
 - Utilize more various sensors to standardize sufficient force for chest compressions.
+- Provide alternative languages in the UI for expanded accesibility.
 
 ---
 
