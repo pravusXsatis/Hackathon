@@ -3,7 +3,7 @@
 #include <WiFi.h>
 
 static const char* AP_SSID = "CPR_Trainer";
-static const char* AP_PASSWORD = "cprtrainer2026";
+static const char* AP_PASSWORD = "cpr2026!";
 static const int AP_CHANNEL = 1;
 static const bool AP_HIDDEN = false;
 static const int AP_MAX_CONNECTIONS = 2;
@@ -20,11 +20,17 @@ static const int ACCEL_Z_PIN = 33; // ADXL335 ZOUT
 static const int LED_PIN = 18; // Optional CPR metronome guide LED (GPIO18 -> resistor -> LED -> GND)
 
 // Tunable CPR demo thresholds. These are relative-force thresholds, not depth.
-static const int DEFAULT_FORCE_TARGET = 800;
+static const int DEFAULT_FORCE_TARGET = 4000; // Fixed raw-force guidance target
 static const int DEFAULT_START_THRESHOLD = 300;
 static const int MIN_FORCE_TARGET = 100;
 static const int RECOIL_THRESHOLD = 30;
+static const int FIXED_FORCE_MIN_RAW = 3500;
+static const int FIXED_FORCE_MAX_RAW = 4500;
+static const int ADC_MAX_RAW = 4095;
+static const int FIXED_FORCE_MAX_EFFECTIVE = ADC_MAX_RAW; // ESP32 ADC max
 static const unsigned long COMPRESSION_DEBOUNCE_MS = 250;
+static const unsigned long RATE_WINDOW_MS = 5000;
+static const int MAX_RATE_EVENTS = 48;
 static const unsigned long LED_METRONOME_INTERVAL_MS = 545; // ~110 BPM pacing guide
 static const unsigned long LED_METRONOME_ON_MS = 110;
 static const bool ENABLE_SERIAL_MONITOR_TELEMETRY = true;
@@ -45,10 +51,14 @@ bool targetCalibrated = false;
 bool inCompression = false;
 int activeCompressionPeak = 0;
 int lastCompressionPeak = 0;
+int activeCompressionPeakRaw = 0;
+int lastCompressionPeakRaw = 0;
 int compressionCount = 0;
-unsigned long lastCompressionTimeMs = 0;
 unsigned long lastCompletedCompressionMs = 0;
 float compressionRate = 0.0;
+unsigned long compressionEventTimesMs[MAX_RATE_EVENTS];
+int compressionEventCount = 0;
+String lastForceFeedback = "Start compressions";
 
 enum LedMode { LED_MODE_METRONOME_110 };
 
@@ -132,6 +142,36 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       cursor: pointer;
     }
     button:disabled { opacity: .6; cursor: default; }
+    .voice-toggle {
+      margin-left: auto;
+      display: inline-flex;
+      align-items: center;
+      gap: 9px;
+      color: #dbe8e9;
+      font-weight: 750;
+      cursor: pointer;
+    }
+    .voice-toggle input {
+      width: 20px;
+      height: 20px;
+      accent-color: #10b981;
+    }
+    .info-card {
+      border: 1px solid rgba(185,203,204,.22);
+      border-radius: 8px;
+      background: rgba(18,24,27,.9);
+      padding: 14px;
+    }
+    .info-card h2 {
+      margin: 0 0 8px;
+      font-size: clamp(1.05rem, 3vw, 1.35rem);
+    }
+    .how-list {
+      margin: 0;
+      padding-left: 20px;
+      color: #dbe8e9;
+      line-height: 1.4;
+    }
     .feedback-card, .rate-panel, .metric-card, .graph-card, .motion-card {
       border: 1px solid rgba(185,203,204,.22);
       border-radius: 8px;
@@ -285,6 +325,7 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     }
     @media (max-width: 560px) {
       .topbar { align-items: flex-start; flex-direction: column; }
+      .voice-toggle { width: 100%; margin-left: 0; }
       button { flex: 1 1 150px; }
       .metrics-grid { grid-template-columns: 1fr; }
     }
@@ -302,6 +343,20 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 
     <section class="control-bar">
       <button id="calibrateBtn" type="button">Start Guided Calibration</button>
+      <label class="voice-toggle">
+        <input id="voiceToggle" type="checkbox">
+        <span>Voice prompts</span>
+      </label>
+    </section>
+
+    <section class="info-card" aria-label="How to Wear the Trainer">
+      <h2>How to Wear the Trainer</h2>
+      <ol class="how-list">
+        <li>Put the workout strap on your right hand.</li>
+        <li>Wrap the strap around your wrist and loop it over your thumb.</li>
+        <li>Place the red square sensor between the practice surface and the bottom of your palm.</li>
+        <li>Keep the red square under your palm during compressions.</li>
+      </ol>
     </section>
 
     <section id="feedbackCard" class="feedback-card idle">
@@ -337,19 +392,15 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 
     <section class="metrics-grid">
       <article class="metric-card"><p class="metric-title">Compression Count</p><p id="compressionCount" class="metric-value">0</p></article>
-      <article class="metric-card"><p class="metric-title">Raw Force</p><p id="forceRaw" class="metric-value">0</p></article>
-      <article class="metric-card"><p class="metric-title">Rest Baseline</p><p id="forceRestBaseline" class="metric-value">0</p></article>
-      <article class="metric-card"><p class="metric-title">Relative Force</p><p id="forceCorrected" class="metric-value">0</p></article>
-      <article class="metric-card"><p class="metric-title">Target Effort</p><p id="forceTarget" class="metric-value">800</p></article>
-      <article class="metric-card"><p class="metric-title">Force Voltage</p><p id="forceVoltage" class="metric-value">0.00</p></article>
+      <article class="metric-card"><p class="metric-title">Compression Rate</p><p id="compressionRateCard" class="metric-value">0.0 CPM</p></article>
       <article class="metric-card"><p class="metric-title">Rate Feedback</p><p id="rateFeedback" class="metric-value">-</p></article>
       <article class="metric-card"><p class="metric-title">Force Feedback</p><p id="forceFeedback" class="metric-value">-</p></article>
     </section>
 
     <section class="graph-card">
       <div class="graph-head">
-        <h2>Relative Force Trend</h2>
-        <span>raw force minus baseline</span>
+        <h2>Compression Graph</h2>
+        <span>live compression pressure pattern</span>
       </div>
       <div class="graph-wrap">
         <canvas id="forceCanvas"></canvas>
@@ -373,13 +424,19 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     const COMPRESSION_START_THRESHOLD = 45;
     const PUSH_HARDER_RATIO = 0.6;
     const TOO_HARD_RATIO = 1.3;
+    const VOICE_COOLDOWN_MS = 3000;
+    const LIVE_VOICE_PROMPTS = new Set(["Too fast", "Too slow", "Push harder", "Release fully", "Good rate"]);
     const state = {
       points: [],
       latest: null,
       compressionActive: false,
       peak: 0,
       lastCompletedAt: 0,
-      qualityFeedback: "Start compressions"
+      qualityFeedback: "Start compressions",
+      calibrationRunning: false,
+      voiceEnabled: false,
+      lastSpoken: "",
+      lastSpokenAt: 0
     };
 
     const meta = {
@@ -454,6 +511,21 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       $("feedbackCue").textContent = info[1];
     }
 
+    function speakIfReady(prompt) {
+      if (!state.voiceEnabled || state.calibrationRunning || !("speechSynthesis" in window)) return;
+      if (!prompt || !LIVE_VOICE_PROMPTS.has(prompt)) return;
+      const now = Date.now();
+      if (prompt === state.lastSpoken && now - state.lastSpokenAt < VOICE_COOLDOWN_MS) return;
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(prompt);
+      utterance.rate = 1.05;
+      utterance.pitch = 1.0;
+      utterance.volume = 0.9;
+      window.speechSynthesis.speak(utterance);
+      state.lastSpoken = prompt;
+      state.lastSpokenAt = now;
+    }
+
     function drawGraph(target) {
       const canvas = $("forceCanvas");
       const rect = canvas.getBoundingClientRect();
@@ -512,18 +584,15 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 
     function render(data) {
       state.latest = data;
-      updateQuality(data);
+      const liveForceFeedback = String(data.forceFeedback || "Start compressions");
+      state.qualityFeedback = liveForceFeedback;
       const relativeForce = round(data.forceCorrected);
       const target = round(data.forceTarget);
       state.points.push(relativeForce);
       state.points = state.points.slice(-MAX_POINTS);
 
-      $("forceRaw").textContent = round(data.forceRaw);
-      $("forceCorrected").textContent = relativeForce;
-      $("forceRestBaseline").textContent = round(data.forceRestBaseline);
-      $("forceTarget").textContent = target;
-      $("forceVoltage").textContent = Number(data.forceVoltage || 0).toFixed(2);
       $("compressionCount").textContent = round(data.compressionCount);
+      $("compressionRateCard").textContent = Number(data.compressionRate || 0).toFixed(1) + " CPM";
       $("rateValue").textContent = Number(data.compressionRate || 0).toFixed(1) + " CPM";
       $("motionMagnitude").textContent = round(data.motionMagnitude);
       $("rateFeedback").textContent = data.rateFeedback || "-";
@@ -532,7 +601,9 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       const ratePercent = Math.max(0, Math.min(100, (Number(data.compressionRate || 0) / 150) * 100));
       $("rateNeedle").style.left = ratePercent + "%";
 
-      setFeedback(state.qualityFeedback);
+      setFeedback(liveForceFeedback);
+      const voicePrompt = [data.rateFeedback, data.forceFeedback, state.qualityFeedback].find((text) => LIVE_VOICE_PROMPTS.has(text));
+      speakIfReady(voicePrompt || "");
       drawGraph(target);
       $("status").textContent = "ESP32 Wi-Fi Live";
     }
@@ -580,20 +651,24 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     async function startCalibration() {
       const button = $("calibrateBtn");
       button.disabled = true;
+      state.calibrationRunning = true;
+      if ("speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
       try {
         await countdown(
           "Step 1",
-          "Place the CPR trainer on your practice surface and keep your hands off the pad.",
+          "Put the trainer on your right hand. Place your hand in CPR position with the red square under the bottom of your palm, but do not press down yet.",
           "/calibrate/rest"
         );
         await sleep(600);
         await countdown(
           "Step 2",
-          "Place your hands where they will be during CPR, then press down with what feels like a good CPR compression and hold it until the countdown reaches 1.",
+          "Press down like a strong CPR compression and briefly put your upper body weight into it. Hold that pressure until the countdown reaches 1.",
           "/calibrate/target"
         );
         await sleep(600);
-        setModal(true, "Step 3", "Now take your hands off the pad completely.", "Waiting for recoil", null);
+        setModal(true, "Step 3", "Now take your hand off the pad completely so the trainer can confirm full recoil.", "Waiting for recoil", null);
 
         const startedAt = Date.now();
         let released = false;
@@ -619,12 +694,21 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
         setModal(true, "Calibration failed", "Check the trainer connection and try again.", "", null);
         await sleep(1800);
       } finally {
+        state.calibrationRunning = false;
         setModal(false);
         button.disabled = false;
       }
     }
 
     $("calibrateBtn").addEventListener("click", startCalibration);
+    $("voiceToggle").addEventListener("change", (event) => {
+      state.voiceEnabled = event.target.checked;
+      state.lastSpoken = "";
+      state.lastSpokenAt = 0;
+      if (!state.voiceEnabled && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    });
     window.addEventListener("resize", () => {
       if (state.latest) drawGraph(round(state.latest.forceTarget));
     });
@@ -659,10 +743,13 @@ void resetCompressionStats() {
   inCompression = false;
   activeCompressionPeak = 0;
   lastCompressionPeak = 0;
+  activeCompressionPeakRaw = 0;
+  lastCompressionPeakRaw = 0;
   compressionCount = 0;
-  lastCompressionTimeMs = 0;
   lastCompletedCompressionMs = 0;
   compressionRate = 0.0;
+  compressionEventCount = 0;
+  lastForceFeedback = "Start compressions";
 }
 
 LedMode computeLedMode() {
@@ -710,32 +797,67 @@ int forceReleaseThreshold() {
   return RECOIL_THRESHOLD;
 }
 
-void updateCompressionStats(int forceCorrected) {
+void pruneRateEvents(unsigned long now) {
+  const unsigned long cutoff = (now > RATE_WINDOW_MS) ? (now - RATE_WINDOW_MS) : 0;
+  while (compressionEventCount > 0 && compressionEventTimesMs[0] < cutoff) {
+    for (int i = 1; i < compressionEventCount; i++) {
+      compressionEventTimesMs[i - 1] = compressionEventTimesMs[i];
+    }
+    compressionEventCount--;
+  }
+}
+
+void recordRateEvent(unsigned long now) {
+  if (compressionEventCount < MAX_RATE_EVENTS) {
+    compressionEventTimesMs[compressionEventCount++] = now;
+  } else {
+    for (int i = 1; i < MAX_RATE_EVENTS; i++) {
+      compressionEventTimesMs[i - 1] = compressionEventTimesMs[i];
+    }
+    compressionEventTimesMs[MAX_RATE_EVENTS - 1] = now;
+    compressionEventCount = MAX_RATE_EVENTS;
+  }
+  pruneRateEvents(now);
+  if (compressionEventCount >= 2) {
+    const unsigned long first = compressionEventTimesMs[0];
+    const unsigned long last = compressionEventTimesMs[compressionEventCount - 1];
+    const unsigned long span = (last > first) ? (last - first) : 0;
+    if (span > 0) {
+      compressionRate = ((compressionEventCount - 1) * 60000.0f) / span;
+      return;
+    }
+  }
+  compressionRate = 0.0f;
+}
+
+void updateCompressionStats(int forceRaw, int forceCorrected) {
   const unsigned long now = millis();
   const int startThreshold = forceStartThreshold();
   const int releaseThreshold = forceReleaseThreshold();
+  pruneRateEvents(now);
+  if (compressionEventCount < 2) {
+    compressionRate = 0.0f;
+  }
 
   if (!inCompression && forceCorrected >= startThreshold && now - lastCompletedCompressionMs >= COMPRESSION_DEBOUNCE_MS) {
     inCompression = true;
     activeCompressionPeak = forceCorrected;
+    activeCompressionPeakRaw = forceRaw;
   }
 
   if (inCompression) {
     activeCompressionPeak = max(activeCompressionPeak, forceCorrected);
+    activeCompressionPeakRaw = max(activeCompressionPeakRaw, forceRaw);
     if (forceCorrected <= releaseThreshold) {
       inCompression = false;
       lastCompressionPeak = activeCompressionPeak;
+      lastCompressionPeakRaw = activeCompressionPeakRaw;
       activeCompressionPeak = 0;
+      activeCompressionPeakRaw = 0;
 
       if (now - lastCompletedCompressionMs >= COMPRESSION_DEBOUNCE_MS) {
         compressionCount++;
-        if (lastCompressionTimeMs > 0) {
-          const unsigned long interval = now - lastCompressionTimeMs;
-          if (interval > 0) {
-            compressionRate = 60000.0 / interval;
-          }
-        }
-        lastCompressionTimeMs = now;
+        recordRateEvent(now);
         lastCompletedCompressionMs = now;
       }
     }
@@ -755,24 +877,39 @@ String rateFeedbackText() {
   return "Too fast";
 }
 
-String forceFeedbackText(int forceCorrected) {
-  if (!targetCalibrated) {
-    return "Calibrate target";
+String forceFeedbackText(int forceRaw, int forceCorrected) {
+  const unsigned long now = millis();
+  int referenceRaw = inCompression ? activeCompressionPeakRaw : lastCompressionPeakRaw;
+  if (referenceRaw <= 0) {
+    referenceRaw = forceRaw;
   }
 
-  const int referenceForce = inCompression ? max(activeCompressionPeak, forceCorrected) : max(lastCompressionPeak, forceCorrected);
-  const float ratio = (float)referenceForce / (float)max(forceTarget, MIN_FORCE_TARGET);
-
-  if (!inCompression && forceCorrected > RECOIL_THRESHOLD && millis() - lastCompletedCompressionMs < 1500) {
-    return "Release fully";
+  if (!inCompression) {
+    if (forceCorrected > RECOIL_THRESHOLD && now - lastCompletedCompressionMs < 1500) {
+      lastForceFeedback = "Release fully";
+      return lastForceFeedback;
+    }
+    // Keep showing the last compression quality briefly after each beat.
+    if (now - lastCompletedCompressionMs > 1800) {
+      lastForceFeedback = "Start compressions";
+      return lastForceFeedback;
+    }
   }
-  if (ratio < 0.60) {
-    return "Push harder";
+  if (referenceRaw < FIXED_FORCE_MIN_RAW) {
+    lastForceFeedback = "Push harder";
+    return lastForceFeedback;
   }
-  if (ratio <= 1.30) {
-    return "Good compression";
+  if (referenceRaw <= FIXED_FORCE_MAX_EFFECTIVE) {
+    lastForceFeedback = "Good compression";
+    return lastForceFeedback;
   }
-  return "Too hard";
+  // Kept for future hardware with wider ADC range.
+  if (referenceRaw <= FIXED_FORCE_MAX_RAW) {
+    lastForceFeedback = "Too hard";
+    return lastForceFeedback;
+  }
+  lastForceFeedback = "Too hard";
+  return lastForceFeedback;
 }
 
 void serveDashboard() {
@@ -792,7 +929,7 @@ void handleData() {
   const int accelZCorrected = accelZRaw - accelZBaseline;
   const int motionMagnitude = abs(accelXCorrected) + abs(accelYCorrected) + abs(accelZCorrected);
 
-  updateCompressionStats(forceCorrected);
+  updateCompressionStats(forceRaw, forceCorrected);
   updateStatusLed();
 
   if (ENABLE_SERIAL_MONITOR_TELEMETRY) {
@@ -854,7 +991,7 @@ void handleData() {
   json += "\"compressionCount\":" + String(compressionCount) + ",";
   json += "\"compressionRate\":" + String(compressionRate, 1) + ",";
   json += "\"rateFeedback\":\"" + rateFeedbackText() + "\",";
-  json += "\"forceFeedback\":\"" + forceFeedbackText(forceCorrected) + "\",";
+  json += "\"forceFeedback\":\"" + forceFeedbackText(forceRaw, forceCorrected) + "\",";
   json += "\"ledMode\":\"" + String(ledModeText(ledMode)) + "\",";
   json += "\"restCalibrated\":" + String(restCalibrated ? "true" : "false") + ",";
   json += "\"targetCalibrated\":" + String(targetCalibrated ? "true" : "false");
@@ -887,8 +1024,8 @@ void handleCalibrateRest() {
 }
 
 void handleCalibrateTarget() {
-  const int targetReading = averageAnalogRead(FORCE_PIN);
-  forceTarget = max(MIN_FORCE_TARGET, targetReading - forceRestBaseline);
+  // Force coaching now uses a fixed raw-force window instead of calibration-derived target.
+  forceTarget = DEFAULT_FORCE_TARGET;
   targetCalibrated = true;
   resetCompressionStats();
 

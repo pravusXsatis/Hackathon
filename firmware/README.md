@@ -30,11 +30,22 @@ The ESP32 creates an open Wi-Fi access point:
 CPR_Trainer
 ```
 
+Password:
+
+```text
+cpr2026!
+```
+
 Connect a phone or laptop to that network. The captive portal should open automatically. If it does not, visit:
 
 ```text
 http://192.168.4.1
 ```
+
+## CPR Learning Link
+
+- Watch CPR basics: [https://youtu.be/VZqG-tcZvfE?si=8la3IrQzfen--zav&t=35](https://youtu.be/VZqG-tcZvfE?si=8la3IrQzfen--zav&t=35)
+- For demos, print a QR code for that link as a separate handout card.
 
 ## Endpoints
 

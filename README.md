@@ -25,7 +25,7 @@ We built the CPR Trainer to remove that barrier entirely. It is a wrist-worn dev
 
 ## What It Does
 
-The CPR Trainer wristband samples compression force at **50 Hz** using an FSR (Force-Sensitive Resistor). The ESP32 microcontroller broadcasts its own Wi-Fi access point, named `CPR_Trainer`; the user connects their phone or laptop to that network and opens the React dashboard at `http://192.168.4.1` — no app install, no internet. The dashboard reads live data and shows rate, relative force, and motion quality.
+The CPR Trainer wristband samples compression force at **50 Hz** using an FSR (Force-Sensitive Resistor). The ESP32 microcontroller broadcasts its own Wi-Fi access point, named `CPR_Trainer` (password: `cpr2026!`); the user connects their phone or laptop to that network and opens the React dashboard at `http://192.168.4.1` — no app install, no internet. The dashboard reads live data and shows rate, relative force, and motion quality.
 
 ### Live feedback on every compression
 
@@ -236,4 +236,6 @@ npm run dev
 
 Open [http://localhost:5173](http://localhost:5173) in a browser.
 
-**On real hardware:** connect your phone or laptop to the **CPR_Trainer** Wi-Fi network broadcast by the ESP32, then open `http://192.168.4.1` in a browser. The dashboard loads directly from the device — no internet needed.
+**On real hardware:** connect your phone or laptop to the **CPR_Trainer** Wi-Fi network (password: `cpr2026!`) broadcast by the ESP32, then open `http://192.168.4.1` in a browser. The dashboard loads directly from the device — no internet needed.
+
+For first-time learners, use this CPR basics video: [https://youtu.be/VZqG-tcZvfE?si=8la3IrQzfen--zav&t=35](https://youtu.be/VZqG-tcZvfE?si=8la3IrQzfen--zav&t=35). For in-person demos, print a QR code for the same link as a separate card/poster.
