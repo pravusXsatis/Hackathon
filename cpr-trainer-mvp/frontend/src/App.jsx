@@ -1,8 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 
-const DEVICE_BASE = "http://192.168.4.1";
+const isLocalDevHost = ["localhost", "127.0.0.1"].includes(window.location.hostname);
+const configuredDeviceBase = import.meta.env.VITE_DEVICE_BASE;
+const DEVICE_BASE = (configuredDeviceBase ?? (isLocalDevHost ? "http://192.168.4.1" : "")).replace(/\/$/, "");
 const POLL_INTERVAL_MS = 50;
 const MAX_FORCE_POINTS = 100;
+const VOICE_COOLDOWN_MS = 2800;
 const TARGET_RATE_MIN = 100;
 const TARGET_RATE_MAX = 120;
 const GAUGE_RATE_MAX = 150;
@@ -17,17 +20,26 @@ const EMPTY_DATA = {
   forceRaw: 0,
   forceCorrected: 0,
   forceTarget: 0,
+  baselineForce: 0,
+  rawTargetForce: 0,
+  restCalibrated: false,
+  targetCalibrated: false,
+  motionMagnitude: 0,
   accelXCorrected: 0,
   accelYCorrected: 0,
   accelZCorrected: 0,
   compressionCount: 0,
   compressionRate: 0,
   feedback: "Start compressions",
+  forceFeedback: "Start compressions",
 };
 
 const FEEDBACK_META = {
   "Good compression": { tone: "good", cue: "Relative force is in target range." },
+  "Good rate": { tone: "good", cue: "Keep compressions steady." },
   "Push harder": { tone: "warn", cue: "Peak force is below 60% of your calibrated target." },
+  "Too slow": { tone: "warn", cue: "Speed up toward 100 to 120 compressions per minute." },
+  "Too fast": { tone: "warn", cue: "Slow down toward 100 to 120 compressions per minute." },
   "Too hard": { tone: "alert", cue: "Peak force is above 130% of your calibrated target." },
   "Release fully": { tone: "alert", cue: "Do not lean between compressions." },
   "Start compressions": { tone: "idle", cue: "Begin when ready." },
@@ -37,6 +49,10 @@ function sleep(ms) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
   });
+}
+
+function endpoint(path) {
+  return `${DEVICE_BASE}${path}`;
 }
 
 function MetricCard({ title, value, unit = "", status = "neutral" }) {
@@ -117,6 +133,7 @@ function ForceGraph({ points, targetLine }) {
 export default function App() {
   const [isConnected, setIsConnected] = useState(false);
   const [pollError, setPollError] = useState(false);
+  const [voiceEnabled, setVoiceEnabled] = useState(false);
   const [sensorData, setSensorData] = useState(EMPTY_DATA);
   const [forcePoints, setForcePoints] = useState([]);
   const [qualityFeedback, setQualityFeedback] = useState("Start compressions");
@@ -131,6 +148,7 @@ export default function App() {
     error: "",
   });
   const latestForceRef = useRef(0);
+  const lastSpokenRef = useRef({ text: "", at: 0 });
   const compressionRef = useRef({
     active: false,
     peak: 0,
@@ -142,7 +160,7 @@ export default function App() {
     let isMounted = true;
     async function pollData() {
       try {
-        const response = await fetch(`${DEVICE_BASE}/data`, { cache: "no-store" });
+        const response = await fetch(endpoint("/data"), { cache: "no-store" });
         if (!response.ok) {
           throw new Error(`Failed (${response.status})`);
         }
@@ -151,18 +169,26 @@ export default function App() {
           return;
         }
 
-        const forceCorrected = Number(data.forceCorrected ?? 0);
-        const forceTarget = Number(data.forceTarget ?? 0);
+        const forceCorrected = Math.round(Number(data.forceCorrected ?? 0));
+        const forceTarget = Math.round(Number(data.forceTarget ?? 0));
+        const baselineForce = Math.round(Number(data.forceRestBaseline ?? data.baselineForce ?? 0));
+        const rawTargetForce = Math.round(Number(data.rawTargetForce ?? baselineForce + forceTarget));
         const next = {
           forceRaw: Number(data.forceRaw ?? 0),
           forceCorrected,
           forceTarget,
+          baselineForce,
+          rawTargetForce,
+          restCalibrated: Boolean(data.restCalibrated),
+          targetCalibrated: Boolean(data.targetCalibrated),
+          motionMagnitude: Number(data.motionMagnitude ?? 0),
           accelXCorrected: Number(data.accelXCorrected ?? 0),
           accelYCorrected: Number(data.accelYCorrected ?? 0),
           accelZCorrected: Number(data.accelZCorrected ?? 0),
           compressionCount: Number(data.compressionCount ?? 0),
           compressionRate: Number(data.compressionRate ?? 0),
-          feedback: String(data.feedback ?? "Start compressions"),
+          feedback: String(data.rateFeedback ?? data.feedback ?? "Start compressions"),
+          forceFeedback: String(data.forceFeedback ?? "Start compressions"),
         };
 
         latestForceRef.current = forceCorrected;
@@ -225,10 +251,48 @@ export default function App() {
   }, [sensorData.forceCorrected, sensorData.forceTarget]);
 
   const feedback = useMemo(() => FEEDBACK_META[qualityFeedback] ?? FEEDBACK_META["Start compressions"], [qualityFeedback]);
+  const voicePrompt = useMemo(() => {
+    return FEEDBACK_META[sensorData.feedback] ? sensorData.feedback : qualityFeedback;
+  }, [qualityFeedback, sensorData.feedback]);
+
+  useEffect(() => {
+    if (!voiceEnabled || !("speechSynthesis" in window)) {
+      return;
+    }
+
+    function speakIfReady() {
+      if (!voicePrompt || voicePrompt === "Start compressions") {
+        return;
+      }
+
+      const now = Date.now();
+      if (voicePrompt === lastSpokenRef.current.text && now - lastSpokenRef.current.at < VOICE_COOLDOWN_MS) {
+        return;
+      }
+
+      window.speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(voicePrompt);
+      utterance.rate = 1.05;
+      utterance.pitch = 1;
+      utterance.volume = 0.9;
+      window.speechSynthesis.speak(utterance);
+      lastSpokenRef.current = { text: voicePrompt, at: now };
+    }
+
+    speakIfReady();
+    const repeatId = window.setInterval(speakIfReady, 500);
+
+    return () => {
+      window.clearInterval(repeatId);
+    };
+  }, [voiceEnabled, voicePrompt]);
 
   const motionMagnitude = useMemo(() => {
+    if (sensorData.motionMagnitude > 0) {
+      return sensorData.motionMagnitude;
+    }
     return Math.abs(sensorData.accelXCorrected) + Math.abs(sensorData.accelYCorrected) + Math.abs(sensorData.accelZCorrected);
-  }, [sensorData.accelXCorrected, sensorData.accelYCorrected, sensorData.accelZCorrected]);
+  }, [sensorData.accelXCorrected, sensorData.accelYCorrected, sensorData.accelZCorrected, sensorData.motionMagnitude]);
 
   async function runCountdown(step, title, detail) {
     setCalibrationState({
@@ -269,7 +333,7 @@ export default function App() {
     const timeoutId = window.setTimeout(() => controller.abort(), 4000);
     let response;
     try {
-      response = await fetch(`${DEVICE_BASE}${path}`, {
+      response = await fetch(endpoint(path), {
         method: "GET",
         cache: "no-store",
         signal: controller.signal,
@@ -373,7 +437,7 @@ export default function App() {
           <h1>CPR Coach</h1>
         </div>
         <span className={isConnected ? "status connected" : "status disconnected"}>
-          {isConnected ? "Connected" : "Connect to CPR_Trainer Wi-Fi"}
+          {isConnected ? "ESP32 Live" : "Waiting for Signal"}
         </span>
       </header>
 
@@ -381,9 +445,13 @@ export default function App() {
         <button type="button" onClick={startGuidedCalibration} disabled={calibrationState.running}>
           {calibrationState.running ? "Calibrating..." : "Start Guided Calibration"}
         </button>
+        <label className="voice-toggle">
+          <input type="checkbox" checked={voiceEnabled} onChange={(event) => setVoiceEnabled(event.target.checked)} />
+          <span>Voice prompts</span>
+        </label>
       </section>
 
-      {pollError && <p className="error-banner">Connect to CPR_Trainer Wi-Fi</p>}
+      {pollError && <p className="error-banner">Connect to CPR_Trainer Wi-Fi. If you are using Vite locally, make sure the ESP32 is reachable at http://192.168.4.1.</p>}
 
       <section className={`feedback-card ${feedback.tone}`}>
         <p className="feedback-label">Compression Quality</p>
@@ -396,9 +464,7 @@ export default function App() {
         <article className="scores-panel">
           <p className="feedback-label">Motion Quality</p>
           <p className="metric-value">{motionMagnitude.toFixed(1)}</p>
-          <p className="score-note">
-            Motion magnitude = |X| + |Y| + |Z| from corrected accelerometer channels.
-          </p>
+          <p className="score-note">Relative movement from corrected accelerometer channels.</p>
         </article>
       </section>
 
@@ -406,15 +472,19 @@ export default function App() {
         <MetricCard title="Compression Count" value={sensorData.compressionCount} />
         <MetricCard title="Compression Rate" value={sensorData.compressionRate.toFixed(1)} unit=" CPM" />
         <MetricCard title="Raw Force" value={Math.round(sensorData.forceRaw)} />
+        <MetricCard title="Rest Baseline" value={sensorData.baselineForce} />
         <MetricCard title="Relative Force" value={sensorData.forceCorrected} />
-        <MetricCard title="Target Force" value={Math.round(sensorData.forceTarget || 0)} />
+        <MetricCard title="Target Effort" value={Math.round(sensorData.forceTarget || 0)} />
+        <MetricCard title="Raw Target" value={sensorData.rawTargetForce} />
         <MetricCard title="Recoil Threshold" value={RELEASE_THRESHOLD} />
+        <MetricCard title="Rate Feedback" value={sensorData.feedback} />
+        <MetricCard title="Force Feedback" value={sensorData.forceFeedback} />
       </section>
 
       <section className="graph-card">
         <div className="graph-head">
           <h2>Relative Force Trend</h2>
-          <span>last {MAX_FORCE_POINTS} readings</span>
+          <span>raw force minus baseline - last {MAX_FORCE_POINTS} readings</span>
         </div>
         <div className="graph-wrap">
           <ForceGraph points={forcePoints} targetLine={sensorData.forceTarget} />

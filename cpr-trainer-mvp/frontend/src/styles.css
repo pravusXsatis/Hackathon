@@ -154,6 +154,11 @@ button:disabled {
   box-shadow: 0 16px 40px rgba(0, 0, 0, 0.22);
 }
 
+.metric-card {
+  min-width: 0;
+  overflow: hidden;
+}
+
 .feedback-card {
   min-height: 170px;
   padding: clamp(18px, 4vw, 34px);
@@ -345,6 +350,8 @@ button:disabled {
   margin-bottom: 0;
   font-size: clamp(1.55rem, 4vw, 2.3rem);
   font-weight: 900;
+  line-height: 1.05;
+  overflow-wrap: anywhere;
 }
 
 .graph-head h2 {

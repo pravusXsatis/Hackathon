@@ -26,6 +26,7 @@ SIMULATOR_SCRIPT = [
   {"label": "Push harder", "duration_s": 9.0, "cpm": 110.0, "amplitude": 150.0, "release_offset": 0.0},
   {"label": "Too slow", "duration_s": 11.0, "cpm": 82.0, "amplitude": 760.0, "release_offset": 0.0},
   {"label": "Good rate", "duration_s": 13.0, "cpm": 110.0, "amplitude": 760.0, "release_offset": 0.0},
+  {"label": "Too hard", "duration_s": 9.0, "cpm": 110.0, "amplitude": 1120.0, "release_offset": 0.0},
   {"label": "Too fast", "duration_s": 11.0, "cpm": 136.0, "amplitude": 760.0, "release_offset": 0.0},
   {"label": "Release fully", "duration_s": 12.0, "cpm": 110.0, "amplitude": 760.0, "release_offset": 38.0},
 ]
@@ -225,6 +226,28 @@ def build_payload(sample: dict[str, Any], metrics: dict[str, Any]) -> dict[str, 
   }
 
 
+def dashboard_data() -> dict[str, Any]:
+  metrics = state.last_metrics
+  raw_force = float(metrics.get("forceLevel", state.force_history[-1]["force"] if state.force_history else 0.0))
+  baseline = float(metrics.get("baselineForce", state.baseline_force))
+  force_corrected = max(0.0, raw_force - baseline)
+  force_target = max(0.0, state.max_force - baseline)
+  return {
+    "forceRaw": raw_force,
+    "forceCorrected": force_corrected,
+    "forceTarget": force_target,
+    "baselineForce": baseline,
+    "rawTargetForce": baseline + force_target,
+    "accelXCorrected": 0.0,
+    "accelYCorrected": 0.0,
+    "accelZCorrected": 0.0,
+    "compressionCount": int(metrics.get("compressionCount", state.compression_count)),
+    "compressionRate": float(metrics.get("compressionRate", 0.0)),
+    "feedback": str(metrics.get("feedback", state.last_feedback)),
+    "simulator": SIMULATOR_ENABLED,
+  }
+
+
 def broadcast_from_thread(payload: dict[str, Any]) -> None:
   if loop and not loop.is_closed():
     asyncio.run_coroutine_threadsafe(manager.broadcast(payload), loop)
@@ -329,10 +352,33 @@ async def simulator_status() -> dict[str, Any]:
   return {"enabled": SIMULATOR_ENABLED, "script": SIMULATOR_SCRIPT}
 
 
+@app.get("/data")
+async def data() -> dict[str, Any]:
+  return dashboard_data()
+
+
 @app.post("/calibrate")
 async def calibrate() -> dict[str, Any]:
   state.start_calibration()
   return {"ok": True, "calibrating": True, "durationMs": state.calibration.duration_ms}
+
+
+@app.get("/calibrate/rest")
+async def calibrate_rest() -> dict[str, Any]:
+  if SIMULATOR_ENABLED:
+    configure_simulator_baseline()
+    return {"ok": True, "baselineForce": state.baseline_force}
+  state.start_calibration()
+  return {"ok": True, "calibrating": True, "durationMs": state.calibration.duration_ms}
+
+
+@app.get("/calibrate/target")
+async def calibrate_target() -> dict[str, Any]:
+  if SIMULATOR_ENABLED:
+    state.max_force = state.baseline_force + 800.0
+    state.dynamic_threshold = max(70.0, (state.max_force - state.baseline_force) * 0.12)
+    return {"ok": True, "targetForce": state.max_force - state.baseline_force}
+  return {"ok": True, "targetForce": state.max_force - state.baseline_force}
 
 
 @app.post("/session/reset")

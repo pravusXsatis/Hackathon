@@ -1,22 +1,32 @@
-# Portable CPR Trainer MVP
+# Portable CPR Trainer
 
-Hackathon-ready software stack for a portable CPR trainer with ESP32 + local dashboard.
+Standalone ESP32 CPR trainer demo. The ESP32 creates its own Wi-Fi network, opens a captive portal, serves the dashboard, and provides live sensor data directly from the board.
 
-## What this MVP includes
+This project uses relative training feedback only: force, rate, recoil, and motion quality. It does not claim exact compression depth in centimeters.
 
-- **ESP32 firmware** that samples force from GPIO34 at ~50 Hz and emits JSON lines over serial.
-- **FastAPI backend** that reads serial JSON, auto-reconnects after serial errors, computes CPR metrics, and broadcasts live data via WebSocket.
-- **React dashboard** with live compression rate, count, force, feedback, and a scrolling force graph.
+## Main Demo Architecture
 
-## File structure
+```text
+ESP32 SoftAP "CPR_Trainer"
+        |
+        v
+Phone/laptop joins ESP32 Wi-Fi
+        |
+        v
+Captive portal opens dashboard from http://192.168.4.1
+        |
+        v
+Dashboard polls ESP32 endpoints directly
+```
+
+The main demo does not depend on USB serial data streaming, Python backend services, localhost, or `127.0.0.1`.
+
+## Repo Structure
 
 ```text
 cpr-trainer-mvp/
   firmware/
     esp32_cpr_trainer.ino
-  backend/
-    main.py
-    requirements.txt
   frontend/
     index.html
     package.json
@@ -25,120 +35,167 @@ cpr-trainer-mvp/
       App.jsx
       main.jsx
       styles.css
+  backend/
+    main.py
+    requirements.txt
 ```
 
-## 1) ESP32 firmware setup
+## Hardware Wiring
+
+- FSR voltage divider midpoint -> GPIO33
+- ADXL335 XOUT -> GPIO34
+- ADXL335 YOUT -> GPIO35
+- ADXL335 ZOUT -> GPIO32
+- ADXL335 VCC -> 3.3V
+- ADXL335 GND -> GND
+- FSR divider example: `3.3V -> FSR -> GPIO33 -> 10k ohm -> GND`
+
+## Upload Firmware
 
 1. Open `firmware/esp32_cpr_trainer.ino` in Arduino IDE.
-2. Install board package for **ESP32**.
-3. Install libraries:
-   - `Adafruit MPU6050`
-   - `Adafruit Unified Sensor`
-4. Wire:
-   - Force sensor analog output -> `GPIO34`
-   - MPU6050 optional (I2C): SDA -> `GPIO21`, SCL -> `GPIO22` (default ESP32)
-5. Flash and open serial monitor at **115200** baud.
+2. Select an ESP32 board, such as **ESP32 Dev Module**.
+3. Upload the sketch.
+4. Open Serial Monitor at `115200` if you want to confirm startup logs.
 
-Example output:
+Required Arduino libraries are included with the ESP32 Arduino core:
 
-```json
-{"t":12345,"force":1842,"ax":0.02,"ay":0.11,"az":1.21}
+- `WiFi.h`
+- `WebServer.h`
+- `DNSServer.h`
+
+## Run The Demo
+
+1. Power the ESP32.
+2. Connect your phone or laptop to Wi-Fi network `CPR_Trainer` with password `cprtrainer2026` (WPA2).
+3. The captive portal should open automatically.
+4. If it does not open, manually visit:
+
+```text
+http://192.168.4.1
 ```
 
-If MPU6050 is missing, JSON still streams with `t` and `force`.
+The ESP32 serves the dashboard from `GET /`.
+The SoftAP is limited to **2 simultaneous client connections**, which helps keep `/data` polling responsive during the live demo.
 
-## 2) Backend setup (FastAPI)
+## Captive Portal
 
-From `backend/`:
+The firmware starts a DNS server and redirects unknown DNS/browser requests to the ESP32 SoftAP IP, normally `192.168.4.1`.
 
-```bash
-python -m venv .venv
-# Windows PowerShell:
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-```
+Captive portal routes include:
 
-Set serial port env var if needed:
+- `GET /generate_204`
+- `GET /hotspot-detect.html`
+- `GET /ncsi.txt`
+- `GET /connecttest.txt`
 
-```bash
-# PowerShell example:
-$env:SERIAL_PORT="COM5"
-$env:SERIAL_BAUD="115200"
-```
+Unknown routes serve the dashboard instead of returning `404`.
 
-Run backend:
+## ESP32 Endpoints
 
-```bash
-uvicorn main:app --reload --port 8000
-```
+The dashboard reads directly from the ESP32:
 
-API endpoints:
+- `GET /`
+- `GET /data`
+- `GET /calibrate/rest`
+- `GET /calibrate/target`
 
-- `GET /health`
-- `POST /calibrate` (captures baseline force for 3s)
-- `POST /session/start`
-- `POST /session/reset`
-- `GET /simulator` (shows the no-hardware practice script)
-- `WS /ws`
+JSON endpoints include CORS headers.
 
-### Practice without hardware
+`GET /data` returns:
 
-If the ESP32 hardware is not ready yet, run the backend in simulator mode:
+- `time`
+- `forceRaw`
+- `forceCorrected`
+- `forceVoltage`
+- `forceRestBaseline`
+- `forceTarget`
+- `accelXRaw`
+- `accelYRaw`
+- `accelZRaw`
+- `accelXCorrected`
+- `accelYCorrected`
+- `accelZCorrected`
+- `accelXVoltage`
+- `accelYVoltage`
+- `accelZVoltage`
+- `motionMagnitude`
+- `compressionCount`
+- `compressionRate`
+- `rateFeedback`
+- `forceFeedback`
+- `restCalibrated`
+- `targetCalibrated`
 
-```bash
-# Windows PowerShell:
-$env:CPR_SIMULATOR="1"
-uvicorn main:app --reload --port 8000
-```
+## Guided Calibration
 
-Then run the frontend as usual and open [http://localhost:5173](http://localhost:5173).
+The dashboard guides the user through:
 
-The simulator streams fake 50 Hz force data and cycles through:
+1. **Rest baseline**: "Place the trainer flat and do not press down."
+   After a 3-second countdown, the dashboard calls `GET /calibrate/rest`.
+2. **Target effort**: "Press down with what feels like a good CPR compression and hold."
+   After a 3-second countdown, the dashboard calls `GET /calibrate/target`.
+3. **Recoil check**: "Release fully."
+   The dashboard polls `GET /data` until `forceCorrected` is close to `0`, then shows calibration complete.
 
-- Push harder
-- Too slow
-- Good rate
-- Too fast
-- Release fully
+## Frontend Development
 
-Use **Reset Session** to restart the scripted practice sequence. Turn on **Voice prompts** in the dashboard to rehearse the audio coaching.
+The ESP32 firmware already serves the main demo dashboard. The React/Vite frontend is for local UI development.
 
-## 3) Frontend setup (React + Vite)
+When the React app is served by the ESP32, it uses relative URLs:
+
+- `/data`
+- `/calibrate/rest`
+- `/calibrate/target`
+
+When running the React app locally with Vite, it falls back to `http://192.168.4.1` unless `VITE_DEVICE_BASE` is set.
 
 From `frontend/`:
 
-```bash
+```powershell
 npm install
-npm run dev
+npm.cmd run dev -- --host 127.0.0.1
 ```
 
-Open [http://localhost:5173](http://localhost:5173)
+Then open:
 
-## CPR logic notes
+```text
+http://127.0.0.1:5173
+```
 
-- Target cadence: **100-120 CPM**
-- Compression detection:
-  - enters compression when force rises above `baseline + dynamic_threshold`
-  - counts compression when force falls near baseline
-  - applies **250 ms debounce** to prevent double count
-- Force score:
-  - normalizes current force above baseline against calibrated force span
-- Release detection:
-  - checks if force returns close to baseline after each compression
-- Rhythm consistency:
-  - derived from variation (coefficient of variation) in recent inter-compression intervals
+Make sure your computer is connected to `CPR_Trainer` Wi-Fi so the local dev app can reach `http://192.168.4.1`.
 
-This is training feedback logic for demos only, not a medical device algorithm.
+Optional override:
 
-## Demo flow
+```powershell
+$env:VITE_DEVICE_BASE="http://192.168.4.1"
+npm.cmd run dev -- --host 127.0.0.1
+```
 
-1. Connect ESP32 and start backend.
-2. Open dashboard.
-3. Press **Calibrate Baseline** without compressing.
-4. Press **Start Session**.
-5. Practice compressions and watch real-time feedback:
-   - Good rate
-   - Too slow
-   - Too fast
-   - Push harder
-   - Release fully
+## Optional Legacy/Dev Backend
+
+The Python backend is not part of the main submission/demo path. It is only an optional development fallback for simulation or older USB-serial workflows.
+
+Use it only when the ESP32 hardware is unavailable or when you deliberately want a simulator:
+
+```powershell
+cd backend
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+$env:CPR_SIMULATOR="1"
+.\.venv\Scripts\python.exe -m uvicorn main:app --port 8000
+```
+
+If using the optional backend with the React dev app:
+
+```powershell
+$env:VITE_DEVICE_BASE="http://127.0.0.1:8000"
+npm.cmd run dev -- --host 127.0.0.1
+```
+
+Again: this backend mode is optional legacy/dev mode, not the standalone ESP32 demo path.
+
+## Notes
+
+- This is for training/demo use only and is not a medical device.
+- Feedback is relative to the user's calibration and sensor readings.
+- The FSR force signal is a proxy for compression effort, not exact chest depth.
