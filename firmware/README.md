@@ -1,5 +1,7 @@
 # ESP32 Firmware
 
+Primary firmware for the current standalone CPR Trainer demo.
+
 Board: ESP32 Dev Module  
 Upload baud: 115200 or 921600  
 Serial Monitor baud: 115200
@@ -24,7 +26,7 @@ Serial Monitor baud: 115200
 
 ## Standalone Demo
 
-The ESP32 creates an open Wi-Fi access point:
+The ESP32 creates a Wi-Fi access point:
 
 ```text
 CPR_Trainer
@@ -42,6 +44,8 @@ Connect a phone or laptop to that network. The captive portal should open automa
 http://192.168.4.1
 ```
 
+This is the current recommended architecture. The older host-computer flow is preserved in `legacy/`.
+
 ## CPR Learning Link
 
 - Watch CPR basics: [https://youtu.be/VZqG-tcZvfE?si=8la3IrQzfen--zav&t=35](https://youtu.be/VZqG-tcZvfE?si=8la3IrQzfen--zav&t=35)
@@ -53,7 +57,12 @@ http://192.168.4.1
 - `GET /data`
 - `GET /calibrate/rest`
 - `GET /calibrate/target`
+- `GET /calibrate` (legacy alias of `/calibrate/rest`)
 
 The firmware also handles common captive portal probe routes and unknown routes by serving the dashboard.
 
 `GET /data` includes `ledMode` as `metronome_110` for the pacing guide LED mode.
+
+## Legacy Note
+
+If you need the previous laptop-hosted pipeline (USB serial -> FastAPI -> React), see the `legacy/` folder in the repository root. Use this firmware README for active hardware demos and current development.
