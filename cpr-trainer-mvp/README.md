@@ -78,7 +78,30 @@ API endpoints:
 - `POST /calibrate` (captures baseline force for 3s)
 - `POST /session/start`
 - `POST /session/reset`
+- `GET /simulator` (shows the no-hardware practice script)
 - `WS /ws`
+
+### Practice without hardware
+
+If the ESP32 hardware is not ready yet, run the backend in simulator mode:
+
+```bash
+# Windows PowerShell:
+$env:CPR_SIMULATOR="1"
+uvicorn main:app --reload --port 8000
+```
+
+Then run the frontend as usual and open [http://localhost:5173](http://localhost:5173).
+
+The simulator streams fake 50 Hz force data and cycles through:
+
+- Push harder
+- Too slow
+- Good rate
+- Too fast
+- Release fully
+
+Use **Reset Session** to restart the scripted practice sequence. Turn on **Voice prompts** in the dashboard to rehearse the audio coaching.
 
 ## 3) Frontend setup (React + Vite)
 

@@ -19,6 +19,18 @@ class SerialConfig(BaseModel):
   baud: int = int(os.getenv("SERIAL_BAUD", "115200"))
 
 
+SIMULATOR_ENABLED = os.getenv("CPR_SIMULATOR", "0").lower() in {"1", "true", "yes", "on"}
+SIMULATOR_BASELINE_FORCE = 520.0
+SIMULATOR_SAMPLE_INTERVAL_MS = 20
+SIMULATOR_SCRIPT = [
+  {"label": "Push harder", "duration_s": 9.0, "cpm": 110.0, "amplitude": 150.0, "release_offset": 0.0},
+  {"label": "Too slow", "duration_s": 11.0, "cpm": 82.0, "amplitude": 760.0, "release_offset": 0.0},
+  {"label": "Good rate", "duration_s": 13.0, "cpm": 110.0, "amplitude": 760.0, "release_offset": 0.0},
+  {"label": "Too fast", "duration_s": 11.0, "cpm": 136.0, "amplitude": 760.0, "release_offset": 0.0},
+  {"label": "Release fully", "duration_s": 12.0, "cpm": 110.0, "amplitude": 760.0, "release_offset": 38.0},
+]
+
+
 class CalibrationState(BaseModel):
   running: bool = False
   started_at_ms: int = 0
@@ -42,7 +54,9 @@ class CPRState:
     self.releases_ok = 0
     self.intervals_ms: deque[float] = deque(maxlen=20)
     self.compression_times_ms: deque[float] = deque(maxlen=30)
+    self.recent_force_scores: deque[float] = deque(maxlen=5)
     self.force_history: deque[dict[str, float]] = deque(maxlen=300)
+    self.current_peak_force_above_baseline = 0.0
     self.last_feedback = "Push harder"
     self.last_metrics: dict[str, Any] = {}
 
@@ -81,6 +95,9 @@ class CPRState:
       self.in_compression = True
 
     release_threshold = self.baseline_force + max(40.0, self.dynamic_threshold * 0.4)
+    if self.in_compression:
+      self.current_peak_force_above_baseline = max(self.current_peak_force_above_baseline, force_above_baseline)
+
     if self.in_compression and force <= release_threshold:
       if now_ms - self.last_compression_ms >= self.debounce_ms:
         self.compression_count += 1
@@ -88,14 +105,16 @@ class CPRState:
           self.intervals_ms.append(now_ms - self.last_compression_ms)
         self.compression_times_ms.append(now_ms)
         self.last_compression_ms = now_ms
+        self.recent_force_scores.append(self._compute_force_score(self.current_peak_force_above_baseline))
 
         if force <= self.baseline_force + 30.0:
           self.releases_ok += 1
       self.in_compression = False
+      self.current_peak_force_above_baseline = 0.0
 
     recent_cpm = self._compute_rate()
     rhythm_score = self._compute_rhythm_score()
-    force_score = self._compute_force_score(force_above_baseline)
+    force_score = statistics.fmean(self.recent_force_scores) if self.recent_force_scores else self._compute_force_score(force_above_baseline)
     release_ratio = (self.releases_ok / self.compression_count) if self.compression_count > 0 else 1.0
 
     self.last_feedback = self._feedback_text(
@@ -190,6 +209,76 @@ serial_cfg = SerialConfig()
 state = CPRState()
 manager = ConnectionManager()
 loop: asyncio.AbstractEventLoop | None = None
+simulator_started_at_ms = int(time.time() * 1000)
+
+
+def build_payload(sample: dict[str, Any], metrics: dict[str, Any]) -> dict[str, Any]:
+  return {
+    "sample": {
+      "t": sample.get("t"),
+      "force": sample.get("force"),
+      "ax": sample.get("ax"),
+      "ay": sample.get("ay"),
+      "az": sample.get("az"),
+    },
+    "metrics": metrics,
+  }
+
+
+def broadcast_from_thread(payload: dict[str, Any]) -> None:
+  if loop and not loop.is_closed():
+    asyncio.run_coroutine_threadsafe(manager.broadcast(payload), loop)
+
+
+def configure_simulator_baseline() -> None:
+  state.baseline_force = SIMULATOR_BASELINE_FORCE
+  state.max_force = SIMULATOR_BASELINE_FORCE + 800.0
+  state.dynamic_threshold = 96.0
+
+
+def current_simulator_phase(elapsed_s: float) -> dict[str, float | str]:
+  total_duration = sum(float(phase["duration_s"]) for phase in SIMULATOR_SCRIPT)
+  cursor = elapsed_s % total_duration
+  for phase in SIMULATOR_SCRIPT:
+    cursor -= float(phase["duration_s"])
+    if cursor <= 0:
+      return phase
+  return SIMULATOR_SCRIPT[-1]
+
+
+def simulator_sample(now_ms: float) -> dict[str, Any]:
+  if state.calibration.running:
+    force = SIMULATOR_BASELINE_FORCE + math.sin(now_ms / 95.0) * 4.0
+  else:
+    elapsed_s = max(0.0, (now_ms - simulator_started_at_ms) / 1000.0)
+    phase = current_simulator_phase(elapsed_s)
+    period_ms = 60_000.0 / float(phase["cpm"])
+    active_ratio = 0.48
+    cycle = (now_ms % period_ms) / period_ms
+    pulse = 0.0
+    if cycle < active_ratio:
+      pulse = math.sin(math.pi * (cycle / active_ratio)) * float(phase["amplitude"])
+    tremor = math.sin(now_ms / 41.0) * 3.0
+    force = SIMULATOR_BASELINE_FORCE + float(phase["release_offset"]) + pulse + tremor
+
+  return {
+    "t": now_ms,
+    "force": max(0.0, force),
+    "ax": math.sin(now_ms / 180.0) * 0.03,
+    "ay": math.cos(now_ms / 210.0) * 0.03,
+    "az": 1.0,
+  }
+
+
+def simulator_thread() -> None:
+  configure_simulator_baseline()
+  print("CPR simulator enabled. Streaming fake force samples at 50 Hz.")
+  while True:
+    now_ms = time.time() * 1000.0
+    sample = simulator_sample(now_ms)
+    metrics = state.process_sample(sample)
+    broadcast_from_thread(build_payload(sample, metrics))
+    time.sleep(SIMULATOR_SAMPLE_INTERVAL_MS / 1000.0)
 
 
 def serial_reader_thread() -> None:
@@ -213,18 +302,7 @@ def serial_reader_thread() -> None:
             continue
 
           metrics = state.process_sample(sample)
-          payload = {
-            "sample": {
-              "t": sample.get("t"),
-              "force": sample.get("force"),
-              "ax": sample.get("ax"),
-              "ay": sample.get("ay"),
-              "az": sample.get("az"),
-            },
-            "metrics": metrics,
-          }
-          if loop and not loop.is_closed():
-            asyncio.run_coroutine_threadsafe(manager.broadcast(payload), loop)
+          broadcast_from_thread(build_payload(sample, metrics))
     except serial.SerialException as exc:
       print(f"Serial error: {exc}. Retrying in 2s.")
       time.sleep(2)
@@ -237,12 +315,18 @@ def serial_reader_thread() -> None:
 async def startup() -> None:
   global loop
   loop = asyncio.get_running_loop()
-  threading.Thread(target=serial_reader_thread, daemon=True).start()
+  target = simulator_thread if SIMULATOR_ENABLED else serial_reader_thread
+  threading.Thread(target=target, daemon=True).start()
 
 
 @app.get("/health")
 async def health() -> dict[str, Any]:
-  return {"ok": True, "serialPort": serial_cfg.port}
+  return {"ok": True, "serialPort": serial_cfg.port, "simulator": SIMULATOR_ENABLED}
+
+
+@app.get("/simulator")
+async def simulator_status() -> dict[str, Any]:
+  return {"enabled": SIMULATOR_ENABLED, "script": SIMULATOR_SCRIPT}
 
 
 @app.post("/calibrate")
@@ -253,9 +337,13 @@ async def calibrate() -> dict[str, Any]:
 
 @app.post("/session/reset")
 async def reset_session() -> dict[str, Any]:
+  global simulator_started_at_ms
   baseline = state.baseline_force
   state.reset_session()
   state.baseline_force = baseline
+  if SIMULATOR_ENABLED:
+    configure_simulator_baseline()
+    simulator_started_at_ms = int(time.time() * 1000)
   return {"ok": True}
 
 
@@ -275,4 +363,3 @@ async def ws_stream(websocket: WebSocket) -> None:
     manager.disconnect(websocket)
   except Exception:
     manager.disconnect(websocket)
-
