@@ -2,7 +2,9 @@
 
 > **Theme: A Brighter Tomorrow** | **Subcategory: Educate the Future**
 >
-> Affordable, hands-on CPR practice — anywhere, anytime, no mannequin required.
+> Affordable, hands-on CPR practice: anywhere, anytime, no mannequin required.
+>
+> ⚠️ Training only — not a certified medical device.
 
 ---
 
@@ -54,8 +56,8 @@ The CPR Trainer wristband samples compression force at **50 Hz** using an FSR (F
 | Component | Detail |
 |---|---|
 | ESP32 | Microcontroller, Wi-Fi access point, web server |
-| Adafruit Square FSR (via voltage divider) | Compression force sensing on GPIO ## |
-| ADXL335 | Motion quality on GPIO ##, ##, ## |
+| Adafruit Square FSR (via voltage divider) | Compression force sensing on GPIO 39 |
+| ADXL335 Accelerometer | Motion quality on GPIO 34, 32, 33 |
 | Battery Pack | Increases project portability |
 
 ### Software Stack
@@ -128,10 +130,6 @@ AI-generated calibration logic did not correctly sequence the rest, target, and 
 **3. Timeout control**
 AI-generated timeout handling in the calibration and data polling loops did not account for edge cases where the ESP32 response was slow. The team manually adjusted timeout durations and added fallback handling to keep the dashboard responsive under real hardware conditions.
 
-**Lesson:** AI-generated data visualization code should be treated as a first draft that requires manual verification of the underlying math, not a finished implementation.
-
-**Lesson:** AI is effective at generating the structure of a simulator but struggles to get domain-specific signal shapes correct without detailed human guidance on the underlying physical model.
-
 ---
 
 ## Challenges We Ran Into
@@ -161,6 +159,7 @@ We also worked through reliability issues while serving both dashboard and live 
 - Improve enclosure and wristband comfort for longer practice sessions.
 - Add data logging and session summaries so users can review progress over time.
 - Improve mobile dashboard layout for smaller screens and faster one-hand use.
+- Utilize more various sensors to standardize sufficient force for chest compressions.
 
 ---
 
