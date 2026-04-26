@@ -13,10 +13,11 @@ static const IPAddress AP_GATEWAY(192, 168, 4, 1);
 static const IPAddress AP_SUBNET(255, 255, 255, 0);
 
 // Sensors
-static const int FORCE_PIN = 33;  // FSR voltage divider midpoint
+static const int FORCE_PIN = 36;  // FSR voltage divider midpoint
 static const int ACCEL_X_PIN = 34; // ADXL335 XOUT
-static const int ACCEL_Y_PIN = 35; // ADXL335 YOUT
-static const int ACCEL_Z_PIN = 32; // ADXL335 ZOUT
+static const int ACCEL_Y_PIN = 32; // ADXL335 YOUT
+static const int ACCEL_Z_PIN = 33; // ADXL335 ZOUT
+static const int LED_PIN = 18; // Optional CPR status LED (GPIO18 -> resistor -> LED -> GND)
 
 // Tunable CPR demo thresholds. These are relative-force thresholds, not depth.
 static const int DEFAULT_FORCE_TARGET = 800;
@@ -24,6 +25,10 @@ static const int DEFAULT_START_THRESHOLD = 300;
 static const int MIN_FORCE_TARGET = 100;
 static const int RECOIL_THRESHOLD = 30;
 static const unsigned long COMPRESSION_DEBOUNCE_MS = 250;
+static const unsigned long LED_METRONOME_INTERVAL_MS = 500; // 120 BPM
+static const unsigned long LED_METRONOME_ON_MS = 110;
+static const bool ENABLE_SERIAL_MONITOR_TELEMETRY = true;
+static const unsigned long SERIAL_TELEMETRY_INTERVAL_MS = 250;
 
 DNSServer dnsServer;
 WebServer server(80);
@@ -44,6 +49,12 @@ int compressionCount = 0;
 unsigned long lastCompressionTimeMs = 0;
 unsigned long lastCompletedCompressionMs = 0;
 float compressionRate = 0.0;
+
+enum LedMode { LED_MODE_METRONOME_120 };
+
+LedMode ledMode = LED_MODE_METRONOME_120;
+bool ledOutputHigh = false;
+unsigned long lastSerialTelemetryMs = 0;
 
 const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 <!doctype html>
@@ -121,20 +132,6 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       cursor: pointer;
     }
     button:disabled { opacity: .6; cursor: default; }
-    .voice-toggle {
-      margin-left: auto;
-      display: inline-flex;
-      align-items: center;
-      gap: 9px;
-      color: #dbe8e9;
-      font-weight: 750;
-      cursor: pointer;
-    }
-    .voice-toggle input {
-      width: 20px;
-      height: 20px;
-      accent-color: #10b981;
-    }
     .feedback-card, .rate-panel, .metric-card, .graph-card, .motion-card {
       border: 1px solid rgba(185,203,204,.22);
       border-radius: 8px;
@@ -288,7 +285,6 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     }
     @media (max-width: 560px) {
       .topbar { align-items: flex-start; flex-direction: column; }
-      .voice-toggle { width: 100%; margin-left: 0; }
       button { flex: 1 1 150px; }
       .metrics-grid { grid-template-columns: 1fr; }
     }
@@ -306,10 +302,6 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
 
     <section class="control-bar">
       <button id="calibrateBtn" type="button">Start Guided Calibration</button>
-      <label class="voice-toggle">
-        <input id="voiceToggle" type="checkbox">
-        <span>Voice prompts</span>
-      </label>
     </section>
 
     <section id="feedbackCard" class="feedback-card idle">
@@ -377,20 +369,17 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
   <script>
     const MAX_POINTS = 100;
     const RELEASE_THRESHOLD = 30;
+    const RELEASE_CLOSE_TO_ZERO_THRESHOLD = 12;
     const COMPRESSION_START_THRESHOLD = 45;
     const PUSH_HARDER_RATIO = 0.6;
     const TOO_HARD_RATIO = 1.3;
-    const VOICE_COOLDOWN_MS = 2800;
     const state = {
       points: [],
       latest: null,
       compressionActive: false,
       peak: 0,
       lastCompletedAt: 0,
-      qualityFeedback: "Start compressions",
-      voiceEnabled: false,
-      lastSpoken: "",
-      lastSpokenAt: 0
+      qualityFeedback: "Start compressions"
     };
 
     const meta = {
@@ -413,6 +402,21 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       const response = await fetch(path, { cache: "no-store" });
       if (!response.ok) throw new Error(path + " failed");
       return response.json();
+    }
+
+    async function fetchJsonWithRetry(path, attempts = 3) {
+      let lastError;
+      for (let attempt = 1; attempt <= attempts; attempt++) {
+        try {
+          return await fetchJson(path);
+        } catch (error) {
+          lastError = error;
+          if (attempt < attempts) {
+            await sleep(180);
+          }
+        }
+      }
+      throw lastError || new Error(path + " failed");
     }
 
     function updateQuality(data) {
@@ -448,20 +452,6 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       $("feedbackCard").className = "feedback-card " + info[0];
       $("qualityFeedback").textContent = text;
       $("feedbackCue").textContent = info[1];
-    }
-
-    function speakIfReady(prompt) {
-      if (!state.voiceEnabled || !("speechSynthesis" in window)) return;
-      if (!prompt || prompt === "Start compressions") return;
-      const now = Date.now();
-      if (prompt === state.lastSpoken && now - state.lastSpokenAt < VOICE_COOLDOWN_MS) return;
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(prompt);
-      utterance.rate = 1.05;
-      utterance.volume = 0.9;
-      window.speechSynthesis.speak(utterance);
-      state.lastSpoken = prompt;
-      state.lastSpokenAt = now;
     }
 
     function drawGraph(target) {
@@ -543,8 +533,6 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       $("rateNeedle").style.left = ratePercent + "%";
 
       setFeedback(state.qualityFeedback);
-      const prompt = meta[data.rateFeedback] ? data.rateFeedback : state.qualityFeedback;
-      speakIfReady(prompt);
       drawGraph(target);
       $("status").textContent = "ESP32 Wi-Fi Live";
     }
@@ -566,34 +554,63 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
       $("modalCountdown").textContent = countdown == null ? "" : String(countdown);
     }
 
-    async function countdown(step, detail) {
-      setModal(true, step, detail, "Hold steady", null);
-      await sleep(500);
-      for (let value = 3; value > 0; value--) {
-        setModal(true, step, detail, "Hold steady", value);
-        await sleep(1000);
+    async function countdown(step, detail, capturePath) {
+      setModal(true, step, detail, "Read the instruction", null);
+      await sleep(1500);
+      for (const cue of ["Ready", "Set", "Go"]) {
+        setModal(true, step, detail, cue, null);
+        await sleep(700);
       }
-      setModal(true, step, detail, "Saving", null);
+      let captured = false;
+      for (let value = 5; value > 0; value--) {
+        setModal(true, step, detail, "Hold steady", value);
+        if (capturePath && value === 1 && !captured) {
+          // Keep "1" visible briefly before and during capture request.
+          await sleep(250);
+          setModal(true, step, detail, "Hold steady", 1);
+          await fetchJsonWithRetry(capturePath, 3);
+          captured = true;
+          await sleep(250);
+        } else {
+          await sleep(1000);
+        }
+      }
     }
 
     async function startCalibration() {
       const button = $("calibrateBtn");
       button.disabled = true;
       try {
-        await countdown("Step 1", "Place the trainer flat and do not press down.");
-        await fetchJson("/calibrate/rest");
+        await countdown(
+          "Step 1",
+          "Place the CPR trainer on your practice surface and keep your hands off the pad.",
+          "/calibrate/rest"
+        );
         await sleep(600);
-        await countdown("Step 2", "Press down with what feels like a good CPR compression and hold.");
-        await fetchJson("/calibrate/target");
+        await countdown(
+          "Step 2",
+          "Place your hands where they will be during CPR, then press down with what feels like a good CPR compression and hold it until the countdown reaches 1.",
+          "/calibrate/target"
+        );
         await sleep(600);
-        setModal(true, "Step 3", "Release fully.", "Waiting for recoil", null);
+        setModal(true, "Step 3", "Now take your hands off the pad completely.", "Waiting for recoil", null);
 
         const startedAt = Date.now();
-        while (Date.now() - startedAt < 8000) {
+        let released = false;
+        while (Date.now() - startedAt < 10000) {
           const data = await fetchJson("/data");
           render(data);
-          if (round(data.forceCorrected) <= RELEASE_THRESHOLD) break;
+          if (round(data.forceCorrected) <= RELEASE_CLOSE_TO_ZERO_THRESHOLD) {
+            released = true;
+            break;
+          }
           await sleep(150);
+        }
+
+        if (!released) {
+          setModal(true, "Step 3", "Release fully — avoid leaning on the pad.", "Still detecting pressure", null);
+          await sleep(1800);
+          return;
         }
 
         setModal(true, "Calibration complete", "Recoil baseline confirmed.", "", null);
@@ -608,11 +625,6 @@ const char DASHBOARD_HTML[] PROGMEM = R"rawliteral(
     }
 
     $("calibrateBtn").addEventListener("click", startCalibration);
-    $("voiceToggle").addEventListener("change", event => {
-      state.voiceEnabled = event.target.checked;
-      state.lastSpoken = "";
-      state.lastSpokenAt = 0;
-    });
     window.addEventListener("resize", () => {
       if (state.latest) drawGraph(round(state.latest.forceTarget));
     });
@@ -651,6 +663,37 @@ void resetCompressionStats() {
   lastCompressionTimeMs = 0;
   lastCompletedCompressionMs = 0;
   compressionRate = 0.0;
+}
+
+LedMode computeLedMode() {
+  return LED_MODE_METRONOME_120;
+}
+
+const char* ledModeText(LedMode mode) {
+  switch (mode) {
+    case LED_MODE_METRONOME_120:
+      return "metronome_120";
+  }
+  return "metronome_120";
+}
+
+bool ledBaseStateForMode(LedMode mode, unsigned long nowMs) {
+  switch (mode) {
+    case LED_MODE_METRONOME_120:
+      return (nowMs % LED_METRONOME_INTERVAL_MS) < LED_METRONOME_ON_MS;
+  }
+  return false;
+}
+
+void updateStatusLed() {
+  const unsigned long nowMs = millis();
+  ledMode = computeLedMode();
+  bool ledOn = ledBaseStateForMode(ledMode, nowMs);
+
+  if (ledOn != ledOutputHigh) {
+    digitalWrite(LED_PIN, ledOn ? HIGH : LOW);
+    ledOutputHigh = ledOn;
+  }
 }
 
 int forceStartThreshold() {
@@ -750,6 +793,46 @@ void handleData() {
   const int motionMagnitude = abs(accelXCorrected) + abs(accelYCorrected) + abs(accelZCorrected);
 
   updateCompressionStats(forceCorrected);
+  updateStatusLed();
+
+  if (ENABLE_SERIAL_MONITOR_TELEMETRY) {
+    const unsigned long nowMs = millis();
+    if (nowMs - lastSerialTelemetryMs >= SERIAL_TELEMETRY_INTERVAL_MS) {
+      Serial.print("forceRaw=");
+      Serial.print(forceRaw);
+      Serial.print(" forceCorrected=");
+      Serial.print(forceCorrected);
+      Serial.print(" baseline=");
+      Serial.print(forceRestBaseline);
+      Serial.print(" target=");
+      Serial.print(forceTarget);
+      Serial.print(" accelRaw=(");
+      Serial.print(accelXRaw);
+      Serial.print(",");
+      Serial.print(accelYRaw);
+      Serial.print(",");
+      Serial.print(accelZRaw);
+      Serial.print(")");
+      Serial.print(" accelCorr=(");
+      Serial.print(accelXCorrected);
+      Serial.print(",");
+      Serial.print(accelYCorrected);
+      Serial.print(",");
+      Serial.print(accelZCorrected);
+      Serial.print(")");
+      Serial.print(" motion=");
+      Serial.print(motionMagnitude);
+      Serial.print(" rate=");
+      Serial.print(compressionRate, 1);
+      Serial.print(" ledMode=");
+      Serial.print(ledModeText(ledMode));
+      Serial.print(" restCal=");
+      Serial.print(restCalibrated ? "1" : "0");
+      Serial.print(" targetCal=");
+      Serial.println(targetCalibrated ? "1" : "0");
+      lastSerialTelemetryMs = nowMs;
+    }
+  }
 
   String json = "{";
   json += "\"time\":" + String(millis()) + ",";
@@ -772,6 +855,7 @@ void handleData() {
   json += "\"compressionRate\":" + String(compressionRate, 1) + ",";
   json += "\"rateFeedback\":\"" + rateFeedbackText() + "\",";
   json += "\"forceFeedback\":\"" + forceFeedbackText(forceCorrected) + "\",";
+  json += "\"ledMode\":\"" + String(ledModeText(ledMode)) + "\",";
   json += "\"restCalibrated\":" + String(restCalibrated ? "true" : "false") + ",";
   json += "\"targetCalibrated\":" + String(targetCalibrated ? "true" : "false");
   json += "}";
@@ -868,6 +952,21 @@ void setup() {
   Serial.begin(115200);
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+  ledOutputHigh = false;
+
+  Serial.print("FORCE_PIN=");
+  Serial.println(FORCE_PIN);
+  Serial.print("ACCEL_X_PIN=");
+  Serial.println(ACCEL_X_PIN);
+  Serial.print("ACCEL_Y_PIN=");
+  Serial.println(ACCEL_Y_PIN);
+  Serial.print("ACCEL_Z_PIN=");
+  Serial.println(ACCEL_Z_PIN);
+  if (FORCE_PIN == ACCEL_X_PIN || FORCE_PIN == ACCEL_Y_PIN || FORCE_PIN == ACCEL_Z_PIN) {
+    Serial.println("WARNING: FORCE_PIN conflicts with an accelerometer pin.");
+  }
 
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(AP_IP, AP_GATEWAY, AP_SUBNET);
@@ -891,4 +990,5 @@ void setup() {
 void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
+  updateStatusLed();
 }
